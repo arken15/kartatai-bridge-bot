@@ -1,0 +1,35 @@
+services:
+  - type: worker
+    name: kartatai-bridge-bot
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    disk:
+      name: bot-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: TELEGRAM_PHONE
+        sync: false
+      - key: CLIENT_BOT_TOKEN
+        sync: false
+      - key: TEAM_BOT_USERNAME
+        value: KartataiFuturaBot
+      - key: OWNER_USER_ID
+        sync: false
+      - key: ALLOWED_USER_IDS
+        sync: false
+      - key: SESSION_NAME
+        value: kartatai_userbot
+      - key: DATA_DIR
+        value: /data
+      - key: SESSION_DIR
+        value: /data/sessions
+      - key: TELEGRAM_SESSION_B64
+        sync: false
+      - key: TELEGRAM_CLIENT_SESSION_B64
+        sync: false

@@ -1,0 +1,10 @@
+# After "создать ссылку" the client bot auto-clicks this path
+# and only then shows the remaining criteria screens.
+navigation:
+  - - "международные"
+  - - "остальные"
+    - "остальное"
+    - "прочее"
+  - - "onlyfans 1.0"
+    - "onlyfans 1"
+    - "onlyfans"
