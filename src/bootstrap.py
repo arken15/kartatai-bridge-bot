@@ -9,7 +9,7 @@ logger = logging.getLogger(__name__)
 
 
 def bootstrap_sessions(session_dir: Path, session_name: str) -> None:
-    """Write Telethon session files from base64 env vars (for cloud deploy)."""
+    """Restore Telethon sessions from env before either client opens them."""
     session_dir.mkdir(parents=True, exist_ok=True)
     mapping = {
         f"{session_name}.session": "TELEGRAM_SESSION_B64",
@@ -20,11 +20,19 @@ def bootstrap_sessions(session_dir: Path, session_name: str) -> None:
         if not raw:
             continue
         target = session_dir / filename
-        if target.exists():
-            logger.info("Session already present: %s", filename)
-            continue
         try:
-            target.write_bytes(base64.b64decode(raw))
+            content = base64.b64decode(raw, validate=True)
+            if not content.startswith(b"SQLite format 3\x00"):
+                raise ValueError(f"{env_key} is not a valid Telethon SQLite session")
+
+            # A first deploy without the B64 variables creates empty session
+            # databases on the persistent disk. Always replace those stale
+            # files when an explicit session value is configured.
+            for suffix in ("-journal", "-wal", "-shm"):
+                Path(f"{target}{suffix}").unlink(missing_ok=True)
+            temporary = target.with_name(f"{target.name}.tmp")
+            temporary.write_bytes(content)
+            temporary.replace(target)
             logger.info("Session restored from env: %s", filename)
         except Exception:
             logger.exception("Failed to restore session %s", filename)
