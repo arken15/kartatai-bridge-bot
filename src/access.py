@@ -106,11 +106,19 @@ class AccessGuard:
                     remaining = deadline - time.time()
                     if remaining <= 0:
                         raise TimeoutError("queue timeout")
-                    await asyncio.wait_for(self._cond.wait(), timeout=min(remaining, 4))
+                    try:
+                        await asyncio.wait_for(
+                            self._cond.wait(),
+                            timeout=min(remaining, 4),
+                        )
+                    except asyncio.TimeoutError:
+                        # Wake periodically to check expiry, but keep waiting
+                        # until the real queue deadline.
+                        continue
             finally:
                 if user_id in self.queue and (not self.lease or self.lease.user_id != user_id):
-                    if time.time() >= deadline:
-                        self.queue = [item for item in self.queue if item != user_id]
+                    self.queue = [item for item in self.queue if item != user_id]
+                    self._cond.notify_all()
 
     async def release(self, user_id: int, token: str | None = None) -> bool:
         async with self._cond:

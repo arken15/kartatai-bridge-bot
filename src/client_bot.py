@@ -12,7 +12,7 @@ from src.access import AccessGuard, Lease
 from src.ads import AdStore
 from src.bot_api import TelegramBotApi
 from src.cleanup import AdCleaner
-from src.config import ROOT_DIR, Settings
+from src.config import Settings
 from src.profits import ProfitStore
 from src.sanitize import (
     NAVIGATION,
@@ -22,12 +22,12 @@ from src.sanitize import (
     is_link_result,
     is_profits_button,
     is_settings_screen,
-    sanitize_settings_text,
     sanitize_text,
     visible_buttons,
 )
 from src.team_bridge import TeamBridge, TeamScreen
 from src.user_store import UserStore
+from src.wallets import WalletStore, normalize_network, validate_address
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ QUEUE_TIMEOUT_TEXT = "⏰ Очередь слишком долгая. Нажми
 class UserState:
     generation: int = 0
     seen_links: set[str] = field(default_factory=set)
+    pending_wallet: str | None = None
 
 
 def _is_allowed(user_id: int, settings: Settings) -> bool:
@@ -85,6 +86,7 @@ class ClientBotApp:
         self.store = UserStore(settings.data_dir / "user_links.json")
         self.profits = ProfitStore(settings.data_dir / "profits.json")
         self.ads = AdStore(settings.data_dir / "ads.json")
+        self.wallets = WalletStore(settings.data_dir / "wallets.json")
         self.cleaner = AdCleaner(self.bridge, self.ads, max_days=3) if self.bridge else None
         self.last_cleanup = 0.0
         self.api = TelegramBotApi(settings.client_bot_token)
@@ -97,6 +99,49 @@ class ClientBotApp:
         if user_id not in self.states:
             self.states[user_id] = UserState()
         return self.states[user_id]
+
+    async def _remember_user(self, event, user_id: int) -> tuple[str, str]:
+        try:
+            sender = await event.get_sender()
+        except Exception:
+            logger.debug("Could not load sender profile user=%s", user_id, exc_info=True)
+            return "", ""
+        username = str(getattr(sender, "username", "") or "")
+        display_name = " ".join(
+            part
+            for part in (
+                str(getattr(sender, "first_name", "") or "").strip(),
+                str(getattr(sender, "last_name", "") or "").strip(),
+            )
+            if part
+        )
+        self.wallets.register_user(
+            user_id,
+            username=username,
+            display_name=display_name,
+        )
+        return username, display_name
+
+    def _wallets_text(self, user_id: int) -> str:
+        wallets = self.wallets.get(user_id)
+        return (
+            "💳 ТВОИ КОШЕЛЬКИ ДЛЯ ВЫПЛАТ\n\n"
+            f"🟥 USDT (TRC-20): {wallets.trc20 or 'не указан'}\n"
+            f"🟨 USDT (BEP-20): {wallets.bep20 or 'не указан'}\n\n"
+            "Нажми нужную сеть, чтобы указать или заменить адрес."
+        )
+
+    @staticmethod
+    def _wallet_prompt(network: str) -> str:
+        if network == "trc20":
+            return (
+                "Отправь адрес USDT TRC-20 одним сообщением.\n"
+                "Он должен начинаться с T и содержать 34 символа."
+            )
+        return (
+            "Отправь адрес USDT BEP-20 одним сообщением.\n"
+            "Он должен начинаться с 0x и содержать 42 символа."
+        )
 
     @staticmethod
     async def _safe_answer(
@@ -149,7 +194,7 @@ class ClientBotApp:
 
         text = sanitize_text(screen.text)
         if is_settings_screen(screen):
-            text = sanitize_settings_text(screen.text)
+            text = self._wallets_text(user_id)
         text = text or "\u2060"
         keyboard = _styled_keyboard(screen, lease.token, state.generation)
 
@@ -264,6 +309,8 @@ class ClientBotApp:
         if user_id is None or not _is_allowed(user_id, self.settings):
             await event.respond("У вас нет доступа к этому боту.")
             return
+        await self._remember_user(event, user_id)
+        self._state(user_id).pending_wallet = None
 
         lease = await self._acquire(user_id, event.respond)
         if lease is None:
@@ -340,6 +387,21 @@ class ClientBotApp:
             await self._show_profits(event.chat_id, user_id, lease, callback_event=event)
             return
 
+        wallet_network = normalize_network(label)
+        current_screen = self.bridge.current_screen()
+        if (
+            wallet_network is not None
+            and current_screen is not None
+            and is_settings_screen(current_screen)
+        ):
+            state.pending_wallet = wallet_network
+            await self._safe_answer(event, "Жду адрес кошелька")
+            await self.bot_client.send_message(
+                event.chat_id,
+                self._wallet_prompt(wallet_network),
+            )
+            return
+
         opening_onlyfans = is_create_link(label)
         if opening_onlyfans:
             await self._safe_answer(event, "Открываю OnlyFans...")
@@ -348,6 +410,16 @@ class ClientBotApp:
             if not self.guard.matches(user_id, token):
                 await self._safe_answer(event, STALE_TEXT, alert=True)
                 return
+            if generation_raw != state.generation:
+                await self._safe_answer(
+                    event,
+                    "Этот клик уже обработан. Используй новое меню.",
+                    alert=True,
+                )
+                return
+            # Consume this screen before the network request. A second rapid
+            # callback must not act on the next team-bot screen.
+            state.generation += 1
             try:
                 screen, toast = await self.bridge.click(row, col)
                 if opening_onlyfans:
@@ -384,6 +456,29 @@ class ClientBotApp:
             return
 
         self.guard.touch(user_id, lease.token)
+        state = self._state(user_id)
+        if state.pending_wallet is not None:
+            network = state.pending_wallet
+            if has_media or not validate_address(network, text):
+                await event.respond(
+                    "❌ Адрес выглядит неверно.\n\n" + self._wallet_prompt(network)
+                )
+                return
+            username, display_name = await self._remember_user(event, user_id)
+            self.wallets.set_address(
+                user_id,
+                network,
+                text,
+                username=username,
+                display_name=display_name,
+            )
+            state.pending_wallet = None
+            await event.respond("✅ Кошелёк сохранён только для твоего аккаунта.")
+            screen = self.bridge.current_screen()
+            if screen is not None:
+                await self._show_screen(event.chat_id, user_id, lease, screen)
+            return
+
         async with self.op_lock:
             if not self.guard.matches(user_id, lease.token):
                 await event.respond(STALE_TEXT)
@@ -415,6 +510,7 @@ class ClientBotApp:
             return
         lease = self.guard.lease
         if lease and lease.user_id == user_id:
+            self._state(user_id).pending_wallet = None
             async with self.op_lock:
                 try:
                     await self._reset_team()
@@ -481,6 +577,50 @@ class ClientBotApp:
         except Exception:
             await event.respond("Клиент не получил уведомление — пусть сначала нажмёт /start.")
 
+    @staticmethod
+    def _wallet_admin_text(wallets) -> str:
+        identity = f"@{wallets.username}" if wallets.username else str(wallets.user_id)
+        if wallets.display_name:
+            identity += f" ({wallets.display_name})"
+        return (
+            f"👤 {identity}\n"
+            f"ID: {wallets.user_id}\n"
+            f"TRC-20: {wallets.trc20 or 'не указан'}\n"
+            f"BEP-20: {wallets.bep20 or 'не указан'}"
+        )
+
+    async def _cmd_wallets(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        if user_id is None or not self._is_admin(user_id):
+            return
+        parts = (event.raw_text or "").split(maxsplit=1)
+        if len(parts) == 2:
+            wallets = self.wallets.find(parts[1])
+            if wallets is None:
+                await event.respond("Пользователь не найден. Он должен сначала открыть бота.")
+                return
+            await event.respond(self._wallet_admin_text(wallets))
+            return
+
+        users = [
+            wallets
+            for wallets in self.wallets.all()
+            if wallets.trc20 or wallets.bep20
+        ]
+        if not users:
+            await event.respond("Пользователи пока не указали кошельки.")
+            return
+        blocks = [self._wallet_admin_text(wallets) for wallets in users]
+        message = "💳 КОШЕЛЬКИ КЛИЕНТОВ\n\n"
+        for block in blocks:
+            addition = block + "\n\n"
+            if len(message) + len(addition) > 3900:
+                await event.respond(message.rstrip())
+                message = ""
+            message += addition
+        if message:
+            await event.respond(message.rstrip())
+
     async def _run_cleanup(self, force: bool = False) -> str:
         if self.cleaner is None or self.bridge is None:
             return "Userbot не готов"
@@ -522,6 +662,7 @@ class ClientBotApp:
                     await self._reset_team()
                 except Exception:
                     logger.exception("idle reset failed")
+            self._state(lease.user_id).pending_wallet = None
             await self.guard.release(lease.user_id, lease.token)
 
     def register_handlers(self) -> None:
@@ -548,6 +689,10 @@ class ClientBotApp:
         @self.bot_client.on(events.NewMessage(pattern=r"^/cleanup"))
         async def cmd_cleanup(event: events.NewMessage.Event) -> None:
             await self._cmd_cleanup(event)
+
+        @self.bot_client.on(events.NewMessage(pattern=r"^/wallets(?:@\w+)?(?:\s|$)"))
+        async def cmd_wallets(event: events.NewMessage.Event) -> None:
+            await self._cmd_wallets(event)
 
         @self.bot_client.on(events.CallbackQuery)
         async def on_callback(event: events.CallbackQuery.Event) -> None:
