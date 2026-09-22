@@ -44,6 +44,10 @@ class UserStore:
             items.append({"ts": int(time.time()), "link": link})
         self._save()
 
+    def user_ids(self) -> list[int]:
+        with self._lock:
+            return [int(key) for key in self._data if str(key).isdigit()]
+
     def links(self, user_id: int) -> list[str]:
         with self._lock:
             return [str(item["link"]) for item in self._data.get(str(user_id), []) if item.get("link")]

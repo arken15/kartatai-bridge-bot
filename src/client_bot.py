@@ -10,9 +10,16 @@ from telethon import TelegramClient, events
 
 from src.access import AccessGuard, Lease
 from src.ads import AdStore
+from src.applications import (
+    PHOTO_QUESTION,
+    QUESTIONS,
+    ApplicationStore,
+    decision_keyboard,
+)
 from src.bot_api import TelegramBotApi
 from src.cleanup import AdCleaner
 from src.config import Settings
+from src.content import ContentStore
 from src.profits import ProfitStore
 from src.sanitize import (
     NAVIGATION,
@@ -20,6 +27,7 @@ from src.sanitize import (
     extract_result_meta,
     is_create_link,
     is_link_result,
+    is_main_menu,
     is_profits_button,
     is_settings_screen,
     sanitize_text,
@@ -43,6 +51,8 @@ class UserState:
     generation: int = 0
     seen_links: set[str] = field(default_factory=set)
     pending_wallet: str | None = None
+    apply_step: int | None = None
+    admin_mode: str | None = None
 
 
 def _is_allowed(user_id: int, settings: Settings) -> bool:
@@ -87,13 +97,20 @@ class ClientBotApp:
         self.profits = ProfitStore(settings.data_dir / "profits.json")
         self.ads = AdStore(settings.data_dir / "ads.json")
         self.wallets = WalletStore(settings.data_dir / "wallets.json")
+        self.apps = ApplicationStore(settings.data_dir / "applications.json")
+        self.content = ContentStore(settings.data_dir / "content.json")
+        for existing_id in {*self.store.user_ids(), *self.profits.all_users()}:
+            self.apps.ensure_approved(existing_id)
         self.cleaner = AdCleaner(self.bridge, self.ads, max_days=3) if self.bridge else None
         self.last_cleanup = 0.0
         self.api = TelegramBotApi(settings.client_bot_token)
         self._watchdog_task: asyncio.Task | None = None
 
     def _is_admin(self, user_id: int) -> bool:
-        return self.settings.owner_user_id is not None and user_id == self.settings.owner_user_id
+        return user_id in self.settings.admin_user_ids
+
+    def _has_access(self, user_id: int) -> bool:
+        return self._is_admin(user_id) or self.apps.is_approved(user_id)
 
     def _state(self, user_id: int) -> UserState:
         if user_id not in self.states:
@@ -197,6 +214,14 @@ class ClientBotApp:
             text = self._wallets_text(user_id)
         text = text or "\u2060"
         keyboard = _styled_keyboard(screen, lease.token, state.generation)
+        if is_main_menu(screen):
+            keyboard.append([
+                {"text": "📘 Мануалы", "callback_data": "m:open", "style": "primary"},
+            ])
+            if self._is_admin(user_id):
+                keyboard.append([
+                    {"text": "🛠 Админ-панель", "callback_data": "adm:home", "style": "danger"},
+                ])
 
         media_path = await self._download_team_media()
         if media_path:
@@ -300,17 +325,143 @@ class ClientBotApp:
             raise RuntimeError("Userbot не подключён")
         return await self.bridge.follow_path(NAVIGATION)
 
-    async def _open_menu(self, event: events.NewMessage.Event) -> None:
-        if self.bridge is None:
-            await event.respond(NO_USERBOT_TEXT)
+    async def _ask_application(self, chat_id: int, step: int) -> None:
+        if step < 3:
+            await self.api.send_text(chat_id, QUESTIONS[step], None)
+            return
+        await self.api.send_text(
+            chat_id,
+            PHOTO_QUESTION,
+            [[{"text": "Пропустить", "callback_data": "app:skip", "style": "primary"}]],
+        )
+
+    async def _start_application(self, event: events.NewMessage.Event, user_id: int) -> None:
+        username, display_name = await self._remember_user(event, user_id)
+        self.apps.start(user_id, username=username, display_name=display_name)
+        state = self._state(user_id)
+        state.apply_step = 0
+        state.pending_wallet = None
+        await event.respond(
+            "Перед доступом к боту нужно заполнить заявку.\n"
+            "Отвечай по одному сообщению на каждый вопрос."
+        )
+        await self._ask_application(event.chat_id, 0)
+
+    async def _submit_application(self, event, user_id: int) -> None:
+        application = self.apps.submit(user_id)
+        self._state(user_id).apply_step = None
+        await event.respond("Заявка отправлена администраторам. Ожидай решения.")
+        delivered = 0
+        for admin_id in self.settings.admin_user_ids:
+            try:
+                photo = application.photo_path
+                keyboard = decision_keyboard(user_id)
+                if photo and Path(photo).exists():
+                    await self.bot_client.send_file(
+                        admin_id,
+                        photo,
+                        caption=application.text(),
+                    )
+                    await self.api.send_text(admin_id, "Решение по заявке:", keyboard)
+                else:
+                    await self.api.send_text(admin_id, application.text(), keyboard)
+                delivered += 1
+            except Exception:
+                logger.exception("Failed to deliver application to admin=%s", admin_id)
+        if delivered == 0:
+            await event.respond(
+                "Заявка сохранена. Админы увидят её в панели, когда откроют /admin."
+            )
+
+    async def _handle_apply_message(self, event: events.NewMessage.Event, user_id: int) -> None:
+        state = self._state(user_id)
+        step = state.apply_step
+        if step is None:
+            return
+        if step < 3:
+            text = (event.raw_text or "").strip()
+            if not text or self._has_media(event.message):
+                await event.respond("Ответь текстом на текущий вопрос.")
+                return
+            if len(text) > 1000:
+                await event.respond("Слишком длинный ответ. Сократи его до 1000 символов.")
+                return
+            self.apps.set_answer(user_id, step, text)
+            state.apply_step = step + 1
+            await self._ask_application(event.chat_id, state.apply_step)
             return
 
+        message = event.message
+        is_image = bool(message.photo) or (
+            message.document is not None
+            and str(getattr(message.document, "mime_type", "")).startswith("image/")
+        )
+        if not is_image:
+            await event.respond("Пришли фото профитов или нажми «Пропустить».")
+            return
+        tmp_dir = self.settings.data_dir / "tmp"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        path = await message.download_media(file=str(tmp_dir))
+        if not path:
+            await event.respond("Не смог сохранить фото. Пришли его ещё раз.")
+            return
+        try:
+            self.apps.attach_photo(user_id, Path(path))
+        finally:
+            Path(path).unlink(missing_ok=True)
+        await self._submit_application(event, user_id)
+
+    def _admin_text(self) -> str:
+        manual = "задан" if self.content.manual_text() else "не задан"
+        return (
+            "🛠 АДМИН-ПАНЕЛЬ\n\n"
+            f"Заявок на рассмотрении: {self.apps.count('pending')}\n"
+            f"Одобрено: {self.apps.count('approved')}\n"
+            f"Мануал: {manual}\n\n"
+            "Команды:\n"
+            "/profit <id или @user> <сумма> [кол-во]\n"
+            "/wallets\n"
+            "/cleanup"
+        )
+
+    def _admin_keyboard(self) -> list[list[dict]]:
+        return [
+            [{"text": "📥 Заявки", "callback_data": "adm:apps", "style": "primary"}],
+            [{"text": "📘 Текст мануала", "callback_data": "adm:manual", "style": "primary"}],
+            [{"text": "💳 Кошельки", "callback_data": "adm:wallets", "style": "primary"}],
+        ]
+
+    async def _show_admin(self, chat_id: int) -> None:
+        await self.api.send_text(chat_id, self._admin_text(), self._admin_keyboard())
+
+    async def _open_menu(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         if user_id is None or not _is_allowed(user_id, self.settings):
             await event.respond("У вас нет доступа к этому боту.")
             return
         await self._remember_user(event, user_id)
-        self._state(user_id).pending_wallet = None
+        state = self._state(user_id)
+        state.pending_wallet = None
+
+        if not self._has_access(user_id):
+            application = self.apps.get(user_id)
+            if application and application.status == "pending":
+                await event.respond("Заявка уже на рассмотрении. Ожидай решения администратора.")
+                return
+            if application and application.status == "rejected":
+                await self.api.send_text(
+                    event.chat_id,
+                    "Заявка отклонена.",
+                    [[{"text": "Подать заново", "callback_data": "app:retry", "style": "primary"}]],
+                )
+                return
+            await self._start_application(event, user_id)
+            return
+
+        if self.bridge is None:
+            await event.respond(NO_USERBOT_TEXT)
+            return
+        state.apply_step = None
 
         lease = await self._acquire(user_id, event.respond)
         if lease is None:
@@ -330,17 +481,154 @@ class ClientBotApp:
             return
         await self._show_screen(event.chat_id, user_id, lease, screen)
 
-    async def _on_callback(self, event: events.CallbackQuery.Event) -> None:
-        if self.bridge is None:
-            await self._safe_answer(event, "Бот не готов", alert=True)
+    async def _decide_application(
+        self,
+        event: events.CallbackQuery.Event,
+        user_id: int,
+        admin_id: int,
+        *,
+        approve: bool,
+    ) -> None:
+        status = "approved" if approve else "rejected"
+        if not self.apps.decide(user_id, status, admin_id):
+            await self._safe_answer(event, "Заявка уже рассмотрена", alert=True)
             return
+        await self._safe_answer(event, "Решение сохранено")
+        decision = "принята" if approve else "отклонена"
+        try:
+            await event.edit(f"Заявка {user_id}: {decision}\nАдмин: {admin_id}")
+        except Exception:
+            logger.debug("Could not edit application message", exc_info=True)
+        notice = (
+            "✅ Заявка принята. Нажми /start — откроется кабинет."
+            if approve
+            else "❌ Заявка отклонена. Нажми /start, если хочешь подать её заново."
+        )
+        try:
+            await self.bot_client.send_message(user_id, notice)
+        except Exception:
+            logger.warning("Applicant %s did not receive the decision", user_id)
 
+    async def _on_local_callback(self, event: events.CallbackQuery.Event, raw: str) -> bool:
+        user_id = event.sender_id
+        if user_id is None:
+            return False
+        parts = raw.split(":")
+        kind = parts[0] if parts else ""
+        if kind not in {"app", "adm", "m"}:
+            return False
+
+        if kind == "app" and len(parts) >= 2 and parts[1] == "skip":
+            if self._state(user_id).apply_step != 3:
+                await self._safe_answer(event, "Сейчас фото не ожидается", alert=True)
+                return True
+            await self._safe_answer(event)
+            await self._submit_application(event, user_id)
+            return True
+
+        if kind == "app" and len(parts) >= 2 and parts[1] == "retry":
+            if self._has_access(user_id):
+                await self._safe_answer(event, "Доступ уже открыт", alert=True)
+                return True
+            await self._safe_answer(event)
+            await self._start_application(event, user_id)
+            return True
+
+        if kind == "app" and len(parts) == 3 and parts[1] in {"ok", "no"}:
+            if not self._is_admin(user_id):
+                await self._safe_answer(event, "Только для админов", alert=True)
+                return True
+            try:
+                applicant_id = int(parts[2])
+            except ValueError:
+                await self._safe_answer(event, "Некорректная заявка", alert=True)
+                return True
+            await self._decide_application(
+                event,
+                applicant_id,
+                user_id,
+                approve=parts[1] == "ok",
+            )
+            return True
+
+        if kind == "m" and len(parts) == 2 and parts[1] == "open":
+            if not self._has_access(user_id):
+                await self._safe_answer(event, "Сначала дождись решения по заявке", alert=True)
+                return True
+            await self._safe_answer(event)
+            manual = self.content.manual_text()
+            await self.api.send_text(
+                event.chat_id,
+                manual or "📘 Мануалы пока не добавлены.",
+                None,
+            )
+            return True
+
+        if kind == "adm":
+            if not self._is_admin(user_id):
+                await self._safe_answer(event, "Только для админов", alert=True)
+                return True
+            action = parts[1] if len(parts) > 1 else "home"
+            await self._safe_answer(event)
+            if action == "apps":
+                pending = self.apps.pending()
+                if not pending:
+                    await self.api.send_text(event.chat_id, "Новых заявок нет.", None)
+                    return True
+                for application in pending[:20]:
+                    photo = application.photo_path
+                    keyboard = decision_keyboard(application.user_id)
+                    if photo and Path(photo).exists():
+                        await self.bot_client.send_file(
+                            event.chat_id,
+                            photo,
+                            caption=application.text(),
+                        )
+                        await self.api.send_text(event.chat_id, "Решение по заявке:", keyboard)
+                    else:
+                        await self.api.send_text(event.chat_id, application.text(), keyboard)
+                if len(pending) > 20:
+                    await self.api.send_text(
+                        event.chat_id,
+                        f"Показаны первые 20 из {len(pending)}.",
+                        None,
+                    )
+                return True
+            if action == "manual":
+                self._state(user_id).admin_mode = "manual"
+                current = self.content.manual_text() or "пока пусто"
+                await self.api.send_text(
+                    event.chat_id,
+                    "Пришли новый текст мануала одним сообщением.\n\n"
+                    f"Сейчас:\n{current[:1000]}",
+                    None,
+                )
+                return True
+            if action == "wallets":
+                await self._send_wallet_report(event.respond)
+                return True
+            await self._show_admin(event.chat_id)
+            return True
+
+        await self._safe_answer(event, "Кнопка устарела", alert=True)
+        return True
+
+    async def _on_callback(self, event: events.CallbackQuery.Event) -> None:
         user_id = event.sender_id
         if user_id is None or not _is_allowed(user_id, self.settings):
             await self._safe_answer(event, "Нет доступа", alert=True)
             return
 
         raw = (event.data or b"").decode("utf-8", errors="ignore")
+        if await self._on_local_callback(event, raw):
+            return
+        if self.bridge is None:
+            await self._safe_answer(event, "Бот не готов", alert=True)
+            return
+        if not self._has_access(user_id):
+            await self._safe_answer(event, "Сначала дождись решения по заявке", alert=True)
+            return
+
         parts = raw.split(":")
         if parts and parts[0] == "p" and len(parts) == 3:
             token, action = parts[1], parts[2]
@@ -437,11 +725,34 @@ class ClientBotApp:
 
         await self._show_screen(event.chat_id, user_id, lease, screen, callback_event=event)
 
-    async def _on_input(self, event: events.NewMessage.Event) -> None:
-        if self.bridge is None:
+    async def _save_manual(self, event: events.NewMessage.Event, user_id: int) -> None:
+        text = (event.raw_text or "").strip()
+        if not text or self._has_media(event.message):
+            await event.respond("Мануал нужно отправить обычным текстом.")
             return
+        try:
+            self.content.set_manual(text, user_id)
+        except ValueError as exc:
+            await event.respond(str(exc))
+            return
+        self._state(user_id).admin_mode = None
+        await event.respond("Мануал сохранён. Клиенты увидят его по кнопке «Мануалы».")
+
+    async def _on_input(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
         if user_id is None or not _is_allowed(user_id, self.settings):
+            return
+        state = self._state(user_id)
+        if state.apply_step is not None:
+            await self._handle_apply_message(event, user_id)
+            return
+        if state.admin_mode == "manual" and self._is_admin(user_id):
+            await self._save_manual(event, user_id)
+            return
+        if not self._has_access(user_id):
+            await event.respond("Доступ откроется после одобрения заявки. Нажми /start.")
+            return
+        if self.bridge is None:
             return
 
         lease = self.guard.lease
@@ -456,7 +767,6 @@ class ClientBotApp:
             return
 
         self.guard.touch(user_id, lease.token)
-        state = self._state(user_id)
         if state.pending_wallet is not None:
             network = state.pending_wallet
             if has_media or not validate_address(network, text):
@@ -508,6 +818,16 @@ class ClientBotApp:
         user_id = event.sender_id
         if user_id is None:
             return
+        state = self._state(user_id)
+        if state.apply_step is not None:
+            state.apply_step = None
+            self.apps.discard_draft(user_id)
+            await event.respond("Анкета отменена. Нажми /start, чтобы заполнить её заново.")
+            return
+        if state.admin_mode is not None:
+            state.admin_mode = None
+            await event.respond("Редактирование мануала отменено.")
+            return
         lease = self.guard.lease
         if lease and lease.user_id == user_id:
             self._state(user_id).pending_wallet = None
@@ -524,7 +844,7 @@ class ClientBotApp:
 
     async def _my_links(self, event: events.NewMessage.Event) -> None:
         user_id = event.sender_id
-        if user_id is None or not _is_allowed(user_id, self.settings):
+        if user_id is None or not _is_allowed(user_id, self.settings) or not self._has_access(user_id):
             return
         links = self.store.links(user_id)
         if not links:
@@ -589,17 +909,13 @@ class ClientBotApp:
             f"BEP-20: {wallets.bep20 or 'не указан'}"
         )
 
-    async def _cmd_wallets(self, event: events.NewMessage.Event) -> None:
-        user_id = event.sender_id
-        if user_id is None or not self._is_admin(user_id):
-            return
-        parts = (event.raw_text or "").split(maxsplit=1)
-        if len(parts) == 2:
-            wallets = self.wallets.find(parts[1])
+    async def _send_wallet_report(self, respond, query: str = "") -> None:
+        if query:
+            wallets = self.wallets.find(query)
             if wallets is None:
-                await event.respond("Пользователь не найден. Он должен сначала открыть бота.")
+                await respond("Пользователь не найден. Он должен сначала открыть бота.")
                 return
-            await event.respond(self._wallet_admin_text(wallets))
+            await respond(self._wallet_admin_text(wallets))
             return
 
         users = [
@@ -608,18 +924,24 @@ class ClientBotApp:
             if wallets.trc20 or wallets.bep20
         ]
         if not users:
-            await event.respond("Пользователи пока не указали кошельки.")
+            await respond("Пользователи пока не указали кошельки.")
             return
-        blocks = [self._wallet_admin_text(wallets) for wallets in users]
         message = "💳 КОШЕЛЬКИ КЛИЕНТОВ\n\n"
-        for block in blocks:
+        for block in (self._wallet_admin_text(wallets) for wallets in users):
             addition = block + "\n\n"
             if len(message) + len(addition) > 3900:
-                await event.respond(message.rstrip())
+                await respond(message.rstrip())
                 message = ""
             message += addition
         if message:
-            await event.respond(message.rstrip())
+            await respond(message.rstrip())
+
+    async def _cmd_wallets(self, event: events.NewMessage.Event) -> None:
+        user_id = event.sender_id
+        if user_id is None or not self._is_admin(user_id):
+            return
+        parts = (event.raw_text or "").split(maxsplit=1)
+        await self._send_wallet_report(event.respond, parts[1] if len(parts) == 2 else "")
 
     async def _run_cleanup(self, force: bool = False) -> str:
         if self.cleaner is None or self.bridge is None:
@@ -693,6 +1015,13 @@ class ClientBotApp:
         @self.bot_client.on(events.NewMessage(pattern=r"^/wallets(?:@\w+)?(?:\s|$)"))
         async def cmd_wallets(event: events.NewMessage.Event) -> None:
             await self._cmd_wallets(event)
+
+        @self.bot_client.on(events.NewMessage(pattern=r"^/admin(?:@\w+)?$"))
+        async def cmd_admin(event: events.NewMessage.Event) -> None:
+            user_id = event.sender_id
+            if user_id is None or not self._is_admin(user_id):
+                return
+            await self._show_admin(event.chat_id)
 
         @self.bot_client.on(events.CallbackQuery)
         async def on_callback(event: events.CallbackQuery.Event) -> None:

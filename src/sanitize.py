@@ -254,6 +254,10 @@ def is_country_select(screen: TeamScreen) -> bool:
     return any(hint in blob for hint in COUNTRY_HINTS)
 
 
+def is_main_menu(screen: TeamScreen) -> bool:
+    return any(is_create_link(text) for _, _, text in visible_buttons(screen))
+
+
 def is_settings_screen(screen: TeamScreen) -> bool:
     buttons = " ".join(button for row in screen.button_rows for button in row)
     blob = _norm(f"{screen.text}\n{buttons}")
